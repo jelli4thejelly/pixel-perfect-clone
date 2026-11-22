@@ -4,6 +4,7 @@ import { supabase } from "@/integrations/supabase/client";
 import { useAuth } from "@/lib/auth";
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
+import { IngredientLinksSettings } from "@/components/app/IngredientLinksSettings";
 
 export const Route = createFileRoute("/_authenticated/app/settings")({
   head: () => ({ meta: [{ title: "Settings — Simmeri" }] }),
@@ -64,17 +65,15 @@ function Settings() {
       const p1 = supabase
         .from("profiles")
         .upsert({ id: user.id, display_name: displayName.trim() || null }, { onConflict: "id" });
-      const p2 = supabase
-        .from("user_preferences")
-        .upsert(
-          {
-            user_id: user.id,
-            language,
-            measurement_system: measurement,
-            timezone,
-          },
-          { onConflict: "user_id" },
-        );
+      const p2 = supabase.from("user_preferences").upsert(
+        {
+          user_id: user.id,
+          language,
+          measurement_system: measurement,
+          timezone,
+        },
+        { onConflict: "user_id" },
+      );
       const [r1, r2] = await Promise.all([p1, p2]);
       if (r1.error) throw r1.error;
       if (r2.error) throw r2.error;
@@ -139,9 +138,12 @@ function Settings() {
                 onChange={(e) => setMeasurement(e.target.value)}
                 className="rounded-xl border border-border bg-background px-3 py-2 text-sm"
               >
-                <option value="metric">Metric</option>
-                <option value="us">US</option>
+                <option value="metric">Metric (grams, ml, °C)</option>
+                <option value="us">US (cups, oz, °F)</option>
               </select>
+              <span className="text-xs text-cocoa/60">
+                Recipe amounts are shown this way. You can switch on any recipe.
+              </span>
             </label>
             <label className="flex flex-col gap-1 text-sm">
               <span className="font-medium text-cocoa">Timezone</span>
@@ -164,6 +166,8 @@ function Settings() {
           </button>
         </div>
       </form>
+
+      <IngredientLinksSettings />
     </div>
   );
 }

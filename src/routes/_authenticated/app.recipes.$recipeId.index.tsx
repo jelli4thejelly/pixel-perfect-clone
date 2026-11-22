@@ -9,8 +9,14 @@ import {
   listCollectionIdsForRecipe,
   listCookingHistory,
   listCookingPhotosForHistoryIds,
+  setRecipeFavorite,
 } from "@/lib/api";
 import { supabase } from "@/integrations/supabase/client";
+import {
+  getIngredientMatcher,
+  useCanonicalKeyOf,
+  useIngredientMatcher,
+} from "@/lib/ingredients/use-ingredient-matcher";
 import {
   computeReadiness,
   readinessDisplay,
@@ -23,6 +29,18 @@ import { CoverPhotoUploader } from "@/components/app/CoverPhotoUploader";
 import { CollectionPicker } from "@/components/app/CollectionPicker";
 import { CookingHistoryForm } from "@/components/app/CookingHistoryForm";
 import { CookingHistoryList } from "@/components/app/CookingHistoryList";
+import { LastCookedSummary } from "@/components/app/LastCookedSummary";
+import { IngredientLinkPicker } from "@/components/app/IngredientLinkPicker";
+import { MeasurementToggle } from "@/components/app/MeasurementToggle";
+import {
+  convertAmount,
+  convertTemperaturesInText,
+  detectMeasurementSystem,
+  type MeasurementSystem,
+} from "@/lib/units/convert";
+import { gramsPerCupFor } from "@/lib/units/densities";
+import { useMeasurementPreference } from "@/lib/units/use-measurement-preference";
+import { PostCookKitchenDialog } from "@/components/app/PostCookKitchenDialog";
 import { MealPlanEntryForm } from "@/components/app/MealPlanEntryForm";
 import { ShoppingGenerationReview } from "@/components/app/ShoppingGenerationReview";
 import { removeRecipeMedia } from "@/lib/media/storage";
@@ -40,6 +58,7 @@ import {
   ChefHat,
   CalendarPlus,
   ShoppingCart,
+  Heart,
 } from "lucide-react";
 import { useState } from "react";
 import {
@@ -58,11 +77,22 @@ function RecipeDetail() {
   const { recipeId } = Route.useParams();
   const navigate = useNavigate();
   const qc = useQueryClient();
+  const keyOf = useIngredientMatcher();
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [showCollectionPicker, setShowCollectionPicker] = useState(false);
   const [showMarkCooked, setShowMarkCooked] = useState(false);
+  const [showPostCookKitchen, setShowPostCookKitchen] = useState(false);
+  const [linkingIngredient, setLinkingIngredient] = useState<string | null>(null);
+  // Amounts are shown in the Settings preference unless the user picks
+  // another system on this recipe (display only; the recipe isn't changed).
+  const preferredSystem = useMeasurementPreference();
+  const [chosenSystem, setChosenSystem] = useState<MeasurementSystem | null>(null);
+  const measureIn = chosenSystem ?? preferredSystem;
+  const canonicalKeyOf = useCanonicalKeyOf();
   const [showAddToPlan, setShowAddToPlan] = useState(false);
-  const [generatedCandidates, setGeneratedCandidates] = useState<GeneratedCandidateItem[] | null>(null);
+  const [generatedCandidates, setGeneratedCandidates] = useState<GeneratedCandidateItem[] | null>(
+    null,
+  );
 
   const collectionsQuery = useQuery({
     queryKey: ["collections", true],
@@ -81,7 +111,10 @@ function RecipeDetail() {
     queryFn: async () => {
       const detail = await getRecipeDetail(recipeId);
       if (!detail) return null;
-      const kit = await supabase.from("kitchen_items").select("*").is("archived_at", null);
+      const [kit, keyOf] = await Promise.all([
+        supabase.from("kitchen_items").select("*").is("archived_at", null),
+        getIngredientMatcher(qc),
+      ]);
       if (kit.error) throw kit.error;
       const readiness = computeReadiness(
         detail.ingredients.map((i) => ({
@@ -89,6 +122,7 @@ function RecipeDetail() {
           importance: i.importance as "core" | "supporting" | "seasoning" | "optional",
         })),
         kit.data ?? [],
+        keyOf,
       );
       return { ...detail, readiness, kitchenItems: kit.data ?? [] };
     },
@@ -100,6 +134,16 @@ function RecipeDetail() {
       toast.success("Archived");
       qc.invalidateQueries();
     },
+  });
+  const favoriteMut = useMutation({
+    mutationFn: async (favorite: boolean) => setRecipeFavorite(recipeId, favorite),
+    onSuccess: (_, favorite) => {
+      toast.success(favorite ? "Added to favorites" : "Removed from favorites");
+      qc.invalidateQueries({ queryKey: ["recipe", recipeId] });
+      qc.invalidateQueries({ queryKey: ["recipes-list"] });
+      qc.invalidateQueries({ queryKey: ["dashboard"] });
+    },
+    onError: (e: Error) => toast.error(e.message),
   });
   const unarchiveMut = useMutation({
     mutationFn: async () => unarchiveRecipe(recipeId),
@@ -160,6 +204,7 @@ function RecipeDetail() {
     const generated = generateCandidates(
       [{ context, ingredients: toGenerationIngredients(data.ingredients) }],
       data.kitchenItems,
+      keyOf,
     );
     setGeneratedCandidates(generated);
   }
@@ -177,6 +222,7 @@ function RecipeDetail() {
     );
 
   const { recipe, ingredients, steps, readiness } = data;
+  const isFavorite = recipe.favorited_at != null;
   const grouped: Record<string, typeof ingredients> = {
     core: [],
     supporting: [],
@@ -184,6 +230,26 @@ function RecipeDetail() {
     optional: [],
   };
   for (const ing of ingredients) grouped[ing.importance]?.push(ing);
+
+  const writtenIn = detectMeasurementSystem(
+    ingredients.map((i) => ({ quantityText: i.quantity_text ?? "", unit: i.unit ?? "" })),
+  );
+  const hasTemperatures = steps.some(
+    (s) =>
+      convertTemperaturesInText(s.instruction, "metric") !== s.instruction ||
+      convertTemperaturesInText(s.instruction, "us") !== s.instruction,
+  );
+  const showMeasurementToggle = writtenIn !== "none" || hasTemperatures;
+  const amountFor = (i: (typeof ingredients)[number]) =>
+    convertAmount(
+      {
+        quantityText: i.quantity_text ?? "",
+        unit: i.unit ?? "",
+        gramsPerCup: gramsPerCupFor(canonicalKeyOf?.(i.display_name) ?? null),
+      },
+      measureIn,
+    );
+  const anyApproximate = ingredients.some((i) => amountFor(i).approximate);
   const groupLabel: Record<string, string> = {
     core: "Core",
     supporting: "Supporting",
@@ -193,7 +259,10 @@ function RecipeDetail() {
 
   return (
     <div className="mx-auto max-w-3xl">
-      <Link to="/app/recipes" className="mb-3 inline-flex items-center gap-1 text-sm text-cocoa hover:underline">
+      <Link
+        to="/app/recipes"
+        className="mb-3 inline-flex items-center gap-1 text-sm text-cocoa hover:underline"
+      >
         <ChevronLeft className="h-4 w-4" /> Back to recipes
       </Link>
 
@@ -237,6 +306,20 @@ function RecipeDetail() {
           </button>
           <button
             type="button"
+            aria-pressed={isFavorite}
+            disabled={favoriteMut.isPending}
+            onClick={() => favoriteMut.mutate(!isFavorite)}
+            className={`inline-flex items-center gap-1 rounded-full border px-3 py-1.5 text-sm disabled:opacity-60 ${
+              isFavorite
+                ? "border-terracotta/40 bg-terracotta/10 text-terracotta"
+                : "border-border bg-background text-cocoa hover:bg-cream-deep/40"
+            }`}
+          >
+            <Heart className={`h-3.5 w-3.5 ${isFavorite ? "fill-current" : ""}`} />
+            {isFavorite ? "Favorite" : "Add to favorites"}
+          </button>
+          <button
+            type="button"
             onClick={() => setShowAddToPlan(true)}
             className="inline-flex items-center gap-1 rounded-full border border-border bg-background px-3 py-1.5 text-sm text-cocoa hover:bg-cream-deep/40"
           >
@@ -272,6 +355,8 @@ function RecipeDetail() {
           </button>
         </div>
       </header>
+
+      <LastCookedSummary recipeId={recipeId} />
 
       {recipe.source_url && shouldShowSourceLink(recipe.source_url) && (
         <section className="mb-6 rounded-3xl border border-border/70 bg-cream/40 p-5">
@@ -348,15 +433,44 @@ function RecipeDetail() {
           <ExpList label="Available" items={readiness.explanation.available} />
           <ExpList label="Running low" items={readiness.explanation.running_low} />
           <ExpList label="Check first" items={readiness.explanation.needs_check} />
-          <ExpList label="Missing core" items={readiness.explanation.missing_core} />
-          <ExpList label="Missing supporting" items={readiness.explanation.missing_supporting} />
-          <ExpList label="Missing seasoning" items={readiness.explanation.missing_seasoning} />
+          <ExpList
+            label="Missing core"
+            items={readiness.explanation.missing_core}
+            onHaveIt={setLinkingIngredient}
+          />
+          <ExpList
+            label="Missing supporting"
+            items={readiness.explanation.missing_supporting}
+            onHaveIt={setLinkingIngredient}
+          />
+          <ExpList
+            label="Missing seasoning"
+            items={readiness.explanation.missing_seasoning}
+            onHaveIt={setLinkingIngredient}
+          />
           <ExpList label="Optional (ignored)" items={readiness.explanation.ignored_optional} />
         </div>
       </section>
 
       <section className="mb-6 rounded-3xl border border-border/70 bg-background p-5">
-        <h2 className="mb-3 font-display text-xl font-semibold text-olive-deep">Ingredients</h2>
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+          <h2 className="font-display text-xl font-semibold text-olive-deep">Ingredients</h2>
+          {showMeasurementToggle && (
+            <MeasurementToggle value={measureIn} onChange={setChosenSystem} />
+          )}
+        </div>
+        {showMeasurementToggle &&
+          measureIn !== "original" &&
+          (writtenIn === "us" || writtenIn === "metric" || writtenIn === "mixed") &&
+          writtenIn !== measureIn && (
+            <p className="mb-3 text-xs text-cocoa/60">
+              Shown in {measureIn === "us" ? "US" : "metric"} measurements
+              {writtenIn === "mixed"
+                ? ""
+                : ` — this recipe was written in ${writtenIn === "us" ? "US" : "metric"}`}
+              .{anyApproximate && " ≈ amounts are estimated from typical cup weights."}
+            </p>
+          )}
         {ingredients.length === 0 && <p className="text-sm text-cocoa/60">No ingredients yet.</p>}
         {(["core", "supporting", "seasoning", "optional"] as const).map((key) =>
           grouped[key].length ? (
@@ -365,20 +479,29 @@ function RecipeDetail() {
                 {groupLabel[key]}
               </h3>
               <ul className="flex flex-col gap-1.5 text-sm text-cocoa">
-                {grouped[key].map((i) => (
-                  <li key={i.id}>
-                    <span className="font-medium">{i.display_name}</span>
-                    {(i.quantity_text || i.unit) && (
-                      <span className="text-cocoa/70">
-                        {" — "}
-                        {[i.quantity_text, i.unit].filter(Boolean).join(" ")}
-                      </span>
-                    )}
-                    {i.preparation_note && (
-                      <span className="text-cocoa/60"> ({i.preparation_note})</span>
-                    )}
-                  </li>
-                ))}
+                {grouped[key].map((i) => {
+                  const amount = amountFor(i);
+                  const original = [i.quantity_text, i.unit].filter(Boolean).join(" ");
+                  return (
+                    <li key={i.id}>
+                      <span className="font-medium">{i.display_name}</span>
+                      {(i.quantity_text || i.unit) && (
+                        <span
+                          className="text-cocoa/70"
+                          title={amount.changed ? `Original: ${original}` : undefined}
+                        >
+                          {" — "}
+                          {amount.changed
+                            ? `${amount.approximate ? "≈ " : ""}${amount.quantityText} ${amount.unit}`
+                            : original}
+                        </span>
+                      )}
+                      {i.preparation_note && (
+                        <span className="text-cocoa/60"> ({i.preparation_note})</span>
+                      )}
+                    </li>
+                  );
+                })}
               </ul>
             </div>
           ) : null,
@@ -394,7 +517,9 @@ function RecipeDetail() {
               <span className="mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-olive-deep/10 text-xs font-medium text-olive-deep">
                 {i + 1}
               </span>
-              <p className="text-sm text-cocoa">{s.instruction}</p>
+              <p className="text-sm text-cocoa">
+                {convertTemperaturesInText(s.instruction, measureIn)}
+              </p>
             </li>
           ))}
         </ol>
@@ -407,7 +532,10 @@ function RecipeDetail() {
         </section>
       )}
 
-      <section className="rounded-3xl border border-border/70 bg-background p-5">
+      <section
+        id="cooking-history"
+        className="scroll-mt-6 rounded-3xl border border-border/70 bg-background p-5"
+      >
         <h2 className="mb-3 font-display text-xl font-semibold text-olive-deep">Cooking History</h2>
         <CookingHistoryList recipeId={recipeId} recipe={recipe} />
       </section>
@@ -419,9 +547,21 @@ function RecipeDetail() {
           onDone={() => {
             setShowMarkCooked(false);
             qc.invalidateQueries({ queryKey: ["cooking-history", recipeId] });
+            setShowPostCookKitchen(true);
           }}
           onClose={() => setShowMarkCooked(false)}
         />
+      )}
+
+      {linkingIngredient && (
+        <IngredientLinkPicker
+          ingredientName={linkingIngredient}
+          onClose={() => setLinkingIngredient(null)}
+        />
+      )}
+
+      {showPostCookKitchen && (
+        <PostCookKitchenDialog recipeId={recipeId} onClose={() => setShowPostCookKitchen(false)} />
       )}
 
       {showAddToPlan && (
@@ -476,12 +616,38 @@ function RecipeDetail() {
   );
 }
 
-function ExpList({ label, items }: { label: string; items: string[] }) {
+function ExpList({
+  label,
+  items,
+  onHaveIt,
+}: {
+  label: string;
+  items: string[];
+  // Missing items offer "I have this" to link the name to a Kitchen item.
+  onHaveIt?: (name: string) => void;
+}) {
   if (items.length === 0) return null;
   return (
     <div>
       <div className="text-xs font-medium uppercase tracking-wide text-cocoa/60">{label}</div>
-      <p className="text-cocoa">{items.join(", ")}</p>
+      {onHaveIt ? (
+        <ul className="mt-0.5 flex flex-col gap-1">
+          {items.map((name) => (
+            <li key={name} className="flex flex-wrap items-center gap-2 text-cocoa">
+              {name}
+              <button
+                type="button"
+                onClick={() => onHaveIt(name)}
+                className="rounded-full border border-border bg-background px-2 py-0.5 text-[11px] text-cocoa/80 hover:bg-cream-deep/40"
+              >
+                I have this
+              </button>
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <p className="text-cocoa">{items.join(", ")}</p>
+      )}
     </div>
   );
 }

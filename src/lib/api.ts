@@ -1,6 +1,8 @@
 import { supabase } from "@/integrations/supabase/client";
 import type { Database, Json } from "@/integrations/supabase/types";
 import type { GenerationPayloadItem } from "@/lib/shopping-generate";
+import type { CookingRating } from "@/lib/cooking-rating";
+import { normalizeForCanonicalMatch } from "@/lib/ingredients/normalize";
 
 export type Recipe = Database["public"]["Tables"]["recipes"]["Row"];
 export type RecipeIngredient = Database["public"]["Tables"]["recipe_ingredients"]["Row"];
@@ -28,11 +30,7 @@ export async function listKitchenItems(includeArchived = false) {
 export async function getRecipeDetail(recipeId: string) {
   const [recipe, ingredients, steps] = await Promise.all([
     supabase.from("recipes").select("*").eq("id", recipeId).maybeSingle(),
-    supabase
-      .from("recipe_ingredients")
-      .select("*")
-      .eq("recipe_id", recipeId)
-      .order("position"),
+    supabase.from("recipe_ingredients").select("*").eq("recipe_id", recipeId).order("position"),
     supabase.from("recipe_steps").select("*").eq("recipe_id", recipeId).order("position"),
   ]);
   if (recipe.error) throw recipe.error;
@@ -258,7 +256,11 @@ export async function listCollectionIdsForRecipe(recipeId: string): Promise<stri
 // Treats "already a member" (Postgres unique-violation 23505 on the
 // composite primary key) as a successful no-op — membership is inherently
 // idempotent, not an error condition, e.g. under a double-click or two-tab race.
-export async function addRecipeToCollection(collectionId: string, recipeId: string, userId: string) {
+export async function addRecipeToCollection(
+  collectionId: string,
+  recipeId: string,
+  userId: string,
+) {
   const { error } = await supabase
     .from("collection_recipes")
     .insert({ collection_id: collectionId, recipe_id: recipeId, user_id: userId });
@@ -293,6 +295,7 @@ export interface CookingHistoryCreateInput {
   cookedAt: string;
   servingsMade: number | null;
   notes: string | null;
+  rating: CookingRating | null;
 }
 
 export async function createCookingHistoryEntry(input: CookingHistoryCreateInput) {
@@ -304,6 +307,7 @@ export async function createCookingHistoryEntry(input: CookingHistoryCreateInput
       cooked_at: input.cookedAt,
       servings_made: input.servingsMade,
       notes: input.notes,
+      rating: input.rating,
     })
     .select("id")
     .single();
@@ -315,6 +319,7 @@ export interface CookingHistoryUpdateInput {
   cookedAt: string;
   servingsMade: number | null;
   notes: string | null;
+  rating: CookingRating | null;
 }
 
 // Only ever touches cooking_history — never the originating recipe's own
@@ -329,9 +334,24 @@ export async function updateCookingHistoryEntry(
       cooked_at: input.cookedAt,
       servings_made: input.servingsMade,
       notes: input.notes,
+      rating: input.rating,
     })
     .eq("id", historyId);
   if (error) throw error;
+}
+
+// Every cooking event for the current user, reduced to the three columns
+// recommendations need (see summarizeCookingHistory). One query instead of
+// one per recipe.
+export async function listCookingHistorySummaryRows(): Promise<
+  Pick<CookingHistory, "recipe_id" | "cooked_at" | "rating">[]
+> {
+  const { data, error } = await supabase
+    .from("cooking_history")
+    .select("recipe_id, cooked_at, rating")
+    .order("cooked_at", { ascending: false });
+  if (error) throw error;
+  return data ?? [];
 }
 
 export async function deleteCookingHistoryEntry(historyId: string) {
@@ -423,6 +443,13 @@ export async function archiveRecipe(id: string) {
 }
 export async function unarchiveRecipe(id: string) {
   const { error } = await supabase.from("recipes").update({ archived_at: null }).eq("id", id);
+  if (error) throw error;
+}
+export async function setRecipeFavorite(id: string, favorite: boolean) {
+  const { error } = await supabase
+    .from("recipes")
+    .update({ favorited_at: favorite ? new Date().toISOString() : null })
+    .eq("id", id);
   if (error) throw error;
 }
 export async function deleteRecipe(id: string) {
@@ -565,7 +592,11 @@ export async function listShoppingLists(includeArchived = false): Promise<Shoppi
 // indistinguishable here — both resolve to null, matching the same pattern
 // already used by getCollection().
 export async function getShoppingList(id: string): Promise<ShoppingList | null> {
-  const { data, error } = await supabase.from("shopping_lists").select("*").eq("id", id).maybeSingle();
+  const { data, error } = await supabase
+    .from("shopping_lists")
+    .select("*")
+    .eq("id", id)
+    .maybeSingle();
   if (error) throw error;
   return data;
 }
@@ -594,7 +625,10 @@ export async function archiveShoppingList(id: string) {
 }
 
 export async function restoreShoppingList(id: string) {
-  const { error } = await supabase.from("shopping_lists").update({ archived_at: null }).eq("id", id);
+  const { error } = await supabase
+    .from("shopping_lists")
+    .update({ archived_at: null })
+    .eq("id", id);
   if (error) throw error;
 }
 
@@ -612,7 +646,9 @@ export async function deleteShoppingList(id: string) {
 export async function listAllShoppingListItemStates(): Promise<
   Pick<ShoppingListItem, "shopping_list_id" | "is_purchased">[]
 > {
-  const { data, error } = await supabase.from("shopping_list_items").select("shopping_list_id, is_purchased");
+  const { data, error } = await supabase
+    .from("shopping_list_items")
+    .select("shopping_list_id, is_purchased");
   if (error) throw error;
   return data ?? [];
 }
@@ -772,4 +808,41 @@ export async function generateShoppingListItems(
   });
   if (error) throw error;
   return data ?? [];
+}
+
+// ---------------------------------------------------------------------------
+// Personal ingredient links ("for me, X is the same as Y") — see
+// src/lib/ingredients/matcher.ts. Names are stored normalized.
+// ---------------------------------------------------------------------------
+
+export type IngredientLink = Database["public"]["Tables"]["user_ingredient_links"]["Row"];
+
+export async function listIngredientLinks(): Promise<IngredientLink[]> {
+  const { data, error } = await supabase
+    .from("user_ingredient_links")
+    .select("*")
+    .order("created_at", { ascending: false });
+  if (error) throw error;
+  return data ?? [];
+}
+
+// Links `aliasName` (e.g. a recipe's "cabe") to `targetName` (e.g. the
+// Kitchen item "cabai merah"). Re-linking the same alias replaces the old
+// target.
+export async function linkIngredientNames(userId: string, aliasName: string, targetName: string) {
+  const alias = normalizeForCanonicalMatch(aliasName);
+  const target = normalizeForCanonicalMatch(targetName);
+  if (!alias || !target || alias === target) return;
+  const { error } = await supabase
+    .from("user_ingredient_links")
+    .upsert(
+      { user_id: userId, alias_normalized: alias, target_normalized: target },
+      { onConflict: "user_id,alias_normalized" },
+    );
+  if (error) throw error;
+}
+
+export async function deleteIngredientLink(id: string) {
+  const { error } = await supabase.from("user_ingredient_links").delete().eq("id", id);
+  if (error) throw error;
 }
